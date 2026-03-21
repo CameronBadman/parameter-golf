@@ -1,0 +1,9 @@
+{
+  "name": "Group-Shared Block Prototype",
+  "val_loss": -1,
+  "bytes_total": 15900000,
+  "blurb": "Prototype experiment: grouped sharing of transformer blocks while keeping per-layer residual and scale parameters on top of the March 20 10-layer mixed-int5/int6 baseline.",
+  "author": "",
+  "github_id": "",
+  "date": "2026-03-21"
+}
