@@ -618,7 +618,7 @@ class BigramHashEmbedding(nn.Module):
 
 
 class SharedCodebookMemory(nn.Module):
-    """Shared learned memory bank queried from hidden states."""
+    """Shared learned memory bank queried once per sequence."""
     def __init__(self, model_dim: int, memory_slots: int, memory_dim: int, topk: int, scale_init: float):
         super().__init__()
         self.memory_slots = memory_slots
@@ -634,7 +634,9 @@ class SharedCodebookMemory(nn.Module):
         nn.init.normal_(self.values, mean=0.0, std=0.02)
 
     def forward(self, x: Tensor) -> Tensor:
-        q = F.normalize(self.query(x), dim=-1)
+        # Query memory once per sequence, then broadcast the retrieved vector.
+        summary = x.mean(dim=1)
+        q = F.normalize(self.query(summary), dim=-1)
         k = F.normalize(self.keys.to(dtype=q.dtype), dim=-1)
         scores = torch.matmul(q, k.transpose(0, 1))
         if self.topk < self.memory_slots:
@@ -645,7 +647,8 @@ class SharedCodebookMemory(nn.Module):
         else:
             weights = F.softmax(scores, dim=-1)
             retrieved = torch.matmul(weights, self.values.to(dtype=q.dtype))
-        return self.proj(retrieved) * self.scale.to(dtype=x.dtype)
+        out = self.proj(retrieved).to(dtype=x.dtype)
+        return out[:, None, :] * self.scale.to(dtype=x.dtype)
 
 
 class Block(nn.Module):

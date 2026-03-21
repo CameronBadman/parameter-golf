@@ -9,9 +9,9 @@ Test whether a small associative memory can buy more useful capacity than spendi
 ## What Changed
 
 - Added `SharedCodebookMemory`, a shared bank of learned `keys` and `values`
-- Added a learned query projection from hidden states into the memory space
-- Retrieval uses top-k soft selection over memory slots
-- Retrieved memory is projected back into model space and added to the residual stream
+- Added a learned query projection from pooled sequence states into the memory space
+- Retrieval uses top-k soft selection over memory slots once per sequence
+- Retrieved memory is projected back into model space and broadcast across the sequence
 - Memory can be injected at `input`, `mid`, or `all` via `MEMORY_LAYERS`
 
 The rest of the strong baseline remains intact:
