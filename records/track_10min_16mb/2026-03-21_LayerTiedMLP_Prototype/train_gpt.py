@@ -95,6 +95,8 @@ class Hyperparameters:
     early_mlp_tie_groups = int(os.environ.get("EARLY_MLP_TIE_GROUPS", 0))
     xsa_layers = int(os.environ.get("XSA_LAYERS", 0))
     xsa_num_kv_heads = int(os.environ.get("XSA_NUM_KV_HEADS", 4))
+    adapter_rank = int(os.environ.get("ADAPTER_RANK", 0))
+    adapter_last_n = int(os.environ.get("ADAPTER_LAST_N", 0))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -745,6 +747,18 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class LowRankAdapter(nn.Module):
+    def __init__(self, dim: int, rank: int):
+        super().__init__()
+        self.down = CastedLinear(dim, rank, bias=False)
+        self.up = CastedLinear(rank, dim, bias=False)
+        self.up._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = torch.relu(self.down(x))
+        return self.up(h)
+
+
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
@@ -794,6 +808,7 @@ class Block(nn.Module):
         qk_gain_init: float,
         mlp_idx: int,
         use_xsa: bool = False,
+        adapter_rank: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -801,8 +816,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.attn.use_xsa = use_xsa
         self.mlp_idx = mlp_idx
+        self.adapter = LowRankAdapter(dim, adapter_rank) if adapter_rank > 0 else None
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.adapter_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if adapter_rank > 0 else None
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, mlp: nn.Module) -> Tensor:
@@ -810,7 +827,10 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(self.mlp_norm(x))
+        h = self.mlp_norm(x)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(h)
+        if self.adapter is not None and self.adapter_scale is not None:
+            x = x + self.adapter_scale.to(dtype=x.dtype)[None, None, :] * self.adapter(h)
         return x
 
 
@@ -835,6 +855,8 @@ class GPT(nn.Module):
         early_mlp_tie_groups: int = 0,
         xsa_layers: int = 0,
         xsa_num_kv_heads: int = 0,
+        adapter_rank: int = 0,
+        adapter_last_n: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -866,6 +888,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
         active_xsa_layers = min(max(xsa_layers, 0), num_layers)
+        active_adapter_layers = min(max(adapter_last_n, 0), num_layers)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -876,6 +899,7 @@ class GPT(nn.Module):
                     qk_gain_init,
                     mlp_idx=self.layer_to_mlp[i],
                     use_xsa=(i >= num_layers - active_xsa_layers),
+                    adapter_rank=(adapter_rank if i >= num_layers - active_adapter_layers else 0),
                 )
                 for i in range(num_layers)
             ]
@@ -1139,6 +1163,8 @@ def main() -> None:
         early_mlp_tie_groups=args.early_mlp_tie_groups,
         xsa_layers=args.xsa_layers,
         xsa_num_kv_heads=args.xsa_num_kv_heads,
+        adapter_rank=args.adapter_rank,
+        adapter_last_n=args.adapter_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1231,6 +1257,7 @@ def main() -> None:
         f"early_mlp_tie_groups:{args.early_mlp_tie_groups} shared_mlps:{base_model.num_mlp_groups}"
     )
     log0(f"xsa_layers:{args.xsa_layers} xsa_num_kv_heads:{args.xsa_num_kv_heads}")
+    log0(f"adapter_rank:{args.adapter_rank} adapter_last_n:{args.adapter_last_n}")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
