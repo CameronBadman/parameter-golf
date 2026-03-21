@@ -1,17 +1,17 @@
 # Codebook Memory Prototype
 
-Prototype fork of the March 20 record script with a shared learned memory bank added on top of the existing 10-layer mixed-int5/int6 recipe.
+Prototype fork of the March 20 record script with a compile-friendly sequence conditioner added on top of the existing 10-layer mixed-int5/int6 recipe.
 
 ## Goal
 
-Test whether a small associative memory can buy more useful capacity than spending the same bytes on a larger hashed bigram table or another conventional width/depth tweak.
+Test whether a tiny global conditioning pathway can buy useful capacity without breaking compilation or throughput.
 
 ## What Changed
 
-- Added `SharedCodebookMemory`, a shared bank of learned `keys` and `values`
-- Added a learned query projection from pooled sequence states into the memory space
-- Retrieval uses top-k soft selection over memory slots once per sequence
-- Retrieved memory is projected back into model space and broadcast across the sequence
+- Added `SharedCodebookMemory` as a sequence-level conditioner
+- Mean-pools the sequence into a summary vector
+- Applies a small dense bottleneck and projects back to model space
+- Broadcasts the resulting conditioning vector across the sequence
 - Memory can be injected at `input`, `mid`, or `all` via `MEMORY_LAYERS`
 
 The rest of the strong baseline remains intact:
@@ -34,7 +34,7 @@ MEMORY_LAYERS=mid
 MEMORY_SCALE_INIT=0.02
 ```
 
-This is intentionally small enough to be a first-pass probe rather than a fully optimized memory-heavy model.
+This is intentionally small enough to be a first-pass probe rather than a fully optimized auxiliary pathway.
 
 ## Run
 
@@ -54,5 +54,5 @@ MEMORY_LAYERS=input,mid,all
 
 ## Notes
 
-- Memory parameters currently quantize through the existing export path. Large 2D memory tensors fall back to the script's general quantization path rather than the special int5/int6 categories used for MLP/attention.
+- Conditioner parameters currently quantize through the existing export path rather than the special int5/int6 categories used for MLP/attention.
 - This is a prototype, not a validated submission. `submission.json` is a placeholder until runs exist.

@@ -618,36 +618,22 @@ class BigramHashEmbedding(nn.Module):
 
 
 class SharedCodebookMemory(nn.Module):
-    """Shared learned memory bank queried once per sequence."""
+    """Compile-friendly sequence conditioner."""
     def __init__(self, model_dim: int, memory_slots: int, memory_dim: int, topk: int, scale_init: float):
         super().__init__()
-        self.memory_slots = memory_slots
-        self.topk = max(1, min(topk, memory_slots))
         self.query = CastedLinear(model_dim, memory_dim, bias=False)
-        self.keys = nn.Parameter(torch.zeros(memory_slots, memory_dim))
-        self.values = nn.Parameter(torch.zeros(memory_slots, memory_dim))
+        self.expand = CastedLinear(memory_dim, memory_dim, bias=False)
         self.proj = CastedLinear(memory_dim, model_dim, bias=False)
         self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
         nn.init.orthogonal_(self.query.weight)
+        nn.init.orthogonal_(self.expand.weight)
         nn.init.orthogonal_(self.proj.weight)
-        nn.init.normal_(self.keys, mean=0.0, std=0.02)
-        nn.init.normal_(self.values, mean=0.0, std=0.02)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Query memory once per sequence, then broadcast the retrieved vector.
         summary = x.mean(dim=1)
-        q = F.normalize(self.query(summary), dim=-1)
-        k = F.normalize(self.keys.to(dtype=q.dtype), dim=-1)
-        scores = torch.matmul(q, k.transpose(0, 1))
-        if self.topk < self.memory_slots:
-            top_scores, top_idx = torch.topk(scores, k=self.topk, dim=-1)
-            selected_values = self.values[top_idx].to(dtype=q.dtype)
-            weights = F.softmax(top_scores, dim=-1)
-            retrieved = (weights.unsqueeze(-1) * selected_values).sum(dim=-2)
-        else:
-            weights = F.softmax(scores, dim=-1)
-            retrieved = torch.matmul(weights, self.values.to(dtype=q.dtype))
-        out = self.proj(retrieved).to(dtype=x.dtype)
+        h = self.query(summary)
+        h = torch.relu(self.expand(h))
+        out = self.proj(h).to(dtype=x.dtype)
         return out[:, None, :] * self.scale.to(dtype=x.dtype)
 
 
