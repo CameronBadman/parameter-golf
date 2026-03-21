@@ -1006,9 +1006,8 @@ def main() -> None:
     if base_model.memory is not None:
         matrix_params.extend([
             base_model.memory.query.weight,
+            base_model.memory.expand.weight,
             base_model.memory.proj.weight,
-            base_model.memory.keys,
-            base_model.memory.values,
         ])
 
     optimizer_tok = torch.optim.AdamW(
