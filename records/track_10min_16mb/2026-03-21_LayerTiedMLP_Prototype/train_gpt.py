@@ -89,6 +89,8 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     mlp_tie_groups = int(os.environ.get("MLP_TIE_GROUPS", 0))
+    early_mlp_shared_layers = int(os.environ.get("EARLY_MLP_SHARED_LAYERS", 0))
+    early_mlp_tie_groups = int(os.environ.get("EARLY_MLP_TIE_GROUPS", 0))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -649,6 +651,8 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         mlp_tie_groups: int = 0,
+        early_mlp_shared_layers: int = 0,
+        early_mlp_tie_groups: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -658,8 +662,22 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.num_mlp_groups = num_layers if mlp_tie_groups <= 0 else min(mlp_tie_groups, num_layers)
+        early_layers = min(max(early_mlp_shared_layers, 0), num_layers)
+        if early_layers > 0:
+            early_groups = min(max(early_mlp_tie_groups, 1), early_layers)
+            self.layer_to_mlp: list[int] = []
+            total_mlps = early_groups + (num_layers - early_layers)
+            for i in range(num_layers):
+                if i < early_layers:
+                    self.layer_to_mlp.append((i * early_groups) // early_layers)
+                else:
+                    self.layer_to_mlp.append(early_groups + (i - early_layers))
+            self.num_mlp_groups = total_mlps
+        else:
+            self.num_mlp_groups = num_layers if mlp_tie_groups <= 0 else min(mlp_tie_groups, num_layers)
+            self.layer_to_mlp = [(i * self.num_mlp_groups) // num_layers for i in range(num_layers)]
         self.shared_mlps = nn.ModuleList([MLP(model_dim, mlp_mult) for _ in range(self.num_mlp_groups)])
+        self.early_mlp_shared_layers = early_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -673,7 +691,7 @@ class GPT(nn.Module):
                     num_kv_heads,
                     rope_base,
                     qk_gain_init,
-                    mlp_idx=(i * self.num_mlp_groups) // num_layers,
+                    mlp_idx=self.layer_to_mlp[i],
                 )
                 for i in range(num_layers)
             ]
@@ -932,6 +950,8 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         mlp_tie_groups=args.mlp_tie_groups,
+        early_mlp_shared_layers=args.early_mlp_shared_layers,
+        early_mlp_tie_groups=args.early_mlp_tie_groups,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1018,7 +1038,10 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(f"mlp_tie_groups:{args.mlp_tie_groups} shared_mlps:{base_model.num_mlp_groups}")
+    log0(
+        f"mlp_tie_groups:{args.mlp_tie_groups} early_mlp_shared_layers:{args.early_mlp_shared_layers} "
+        f"early_mlp_tie_groups:{args.early_mlp_tie_groups} shared_mlps:{base_model.num_mlp_groups}"
+    )
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
