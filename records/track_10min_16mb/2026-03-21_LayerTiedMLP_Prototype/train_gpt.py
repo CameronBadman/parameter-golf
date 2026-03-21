@@ -305,6 +305,10 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+ADAPTIVE_QUANT_ENABLED = bool(int(os.environ.get("ADAPTIVE_QUANT_ENABLED", "0")))
+ADAPTIVE_QUANT_BYTE_BUDGET = int(os.environ.get("ADAPTIVE_QUANT_BYTE_BUDGET", 900_000))
+ADAPTIVE_QUANT_MAX_FP16 = int(os.environ.get("ADAPTIVE_QUANT_MAX_FP16", 1))
+ADAPTIVE_QUANT_MAX_INT8 = int(os.environ.get("ADAPTIVE_QUANT_MAX_INT8", 12))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -350,6 +354,155 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
     return q, scale
+
+
+def dequantize_tensor(q: Tensor, s: Tensor, orig_dtype: torch.dtype) -> Tensor:
+    if s.ndim > 0:
+        return (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
+    return (q.float() * float(s.item())).to(orig_dtype)
+
+
+def quantized_payload_nbytes(q: Tensor, s: Tensor) -> int:
+    return tensor_nbytes(q) + tensor_nbytes(s)
+
+
+def quantize_tensor_scheme(t: Tensor, scheme: str) -> tuple[dict[str, Tensor], object]:
+    if scheme == "fp16":
+        return {"value": t.to(dtype=torch.float16).contiguous()}, "passthrough_fp16"
+    if scheme == "fp32":
+        return {"value": t.float().contiguous()}, "passthrough_ctrl"
+    if scheme == "int8":
+        q, s = quantize_float_tensor(t)
+        return {"q": q, "scale": s}, {"type": "int8"}
+    if scheme == "int6":
+        q, s = quantize_intN_per_row(t, clip_range=31)
+        return {"q": q, "scale": s}, {"type": "int6"}
+    if scheme == "int5":
+        q, s = quantize_intN_per_row(t, clip_range=15)
+        return {"q": q, "scale": s}, {"type": "int5"}
+    raise ValueError(f"Unknown quantization scheme: {scheme}")
+
+
+def baseline_scheme_for_tensor(name: str, t: Tensor, int6_cats: set[str]) -> str:
+    cat = _classify_param(name)
+    if not t.is_floating_point() or t.numel() <= 8192:
+        return "passthrough"
+    if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+        return "fp32"
+    if any(pattern in name for pattern in FP16_KEEP_NAME_PATTERNS):
+        return "fp16"
+    if cat in int6_cats and t.ndim >= 1:
+        return "int5" if cat == "mlp" else "int6"
+    return "int8"
+
+
+def approximate_scheme_nbytes(t: Tensor, scheme: str) -> int:
+    if scheme == "passthrough":
+        return tensor_nbytes(t.to(torch.float16) if t.is_floating_point() else t)
+    if scheme == "fp16":
+        return int(t.numel()) * 2
+    if scheme == "fp32":
+        return int(t.numel()) * 4
+    if scheme == "int8":
+        q, s = quantize_float_tensor(t)
+        return quantized_payload_nbytes(q, s)
+    if scheme == "int6":
+        q, s = quantize_intN_per_row(t, clip_range=31)
+        return quantized_payload_nbytes(q, s)
+    if scheme == "int5":
+        q, s = quantize_intN_per_row(t, clip_range=15)
+        return quantized_payload_nbytes(q, s)
+    raise ValueError(f"Unknown quantization scheme: {scheme}")
+
+
+def _scheme_error(t: Tensor, scheme: str) -> float:
+    t = t.detach().cpu().contiguous()
+    if scheme in ("passthrough", "fp16", "fp32"):
+        if scheme == "passthrough":
+            ref = t.to(torch.float16) if t.is_floating_point() else t
+            recon = ref.to(t.dtype) if ref.dtype != t.dtype else ref
+        elif scheme == "fp16":
+            recon = t.to(torch.float16).to(t.dtype)
+        else:
+            recon = t.float().to(t.dtype)
+        diff = (recon.float() - t.float()).pow(2).mean().item() if t.is_floating_point() else 0.0
+        return float(diff)
+    payload, _ = quantize_tensor_scheme(t, scheme)
+    recon = dequantize_tensor(payload["q"], payload["scale"], t.dtype)
+    return float((recon.float() - t.float()).pow(2).mean().item())
+
+
+def mixed_quantize_adaptive(state_dict: dict[str, Tensor], int6_cats: set[str]):
+    scheme_map: dict[str, str] = {}
+    for name, tensor in state_dict.items():
+        scheme_map[name] = baseline_scheme_for_tensor(name, tensor, int6_cats)
+
+    if ADAPTIVE_QUANT_ENABLED and ADAPTIVE_QUANT_BYTE_BUDGET > 0:
+        candidates: list[tuple[float, int, str, str]] = []
+        fp16_used = 0
+        int8_used = 0
+        for name, tensor in state_dict.items():
+            t = tensor.detach().cpu().contiguous()
+            base_scheme = scheme_map[name]
+            if base_scheme not in ("int5", "int6"):
+                continue
+            base_err = _scheme_error(t, base_scheme)
+            if base_err <= 0.0:
+                continue
+            base_bytes = approximate_scheme_nbytes(t, base_scheme)
+            for promoted_scheme in ("int8", "fp16"):
+                promoted_err = _scheme_error(t, promoted_scheme)
+                extra_bytes = approximate_scheme_nbytes(t, promoted_scheme) - base_bytes
+                if extra_bytes <= 0:
+                    continue
+                benefit = max(base_err - promoted_err, 0.0) * float(t.numel())
+                if benefit <= 0.0:
+                    continue
+                utility = benefit / float(extra_bytes)
+                candidates.append((utility, extra_bytes, name, promoted_scheme))
+        budget_left = ADAPTIVE_QUANT_BYTE_BUDGET
+        promoted: list[str] = []
+        for _, extra_bytes, name, promoted_scheme in sorted(candidates, reverse=True):
+            if scheme_map[name] != baseline_scheme_for_tensor(name, state_dict[name], int6_cats):
+                continue
+            if extra_bytes > budget_left:
+                continue
+            if promoted_scheme == "fp16":
+                if fp16_used >= ADAPTIVE_QUANT_MAX_FP16:
+                    continue
+                fp16_used += 1
+            else:
+                if int8_used >= ADAPTIVE_QUANT_MAX_INT8:
+                    continue
+                int8_used += 1
+            scheme_map[name] = promoted_scheme
+            budget_left -= extra_bytes
+            promoted.append(f"{name}:{promoted_scheme}")
+        if promoted:
+            print(
+                "adaptive_quant:"
+                f" promoted={len(promoted)} budget_used={ADAPTIVE_QUANT_BYTE_BUDGET - budget_left}"
+                f" budget_total={ADAPTIVE_QUANT_BYTE_BUDGET} names={','.join(promoted[:8])}",
+                flush=True,
+            )
+
+    result: dict[str, Tensor] = {}
+    meta: dict[str, object] = {}
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        scheme = scheme_map[name]
+        if scheme == "passthrough":
+            result[name] = t.to(torch.float16) if t.is_floating_point() else t
+            meta[name] = "passthrough"
+            continue
+        payload, info = quantize_tensor_scheme(t, scheme)
+        if scheme in ("fp16", "fp32"):
+            result[name] = payload["value"]
+        else:
+            result[name + ".q"] = payload["q"]
+            result[name + ".scale"] = payload["scale"]
+        meta[name] = info
+    return result, meta
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     result: dict[str, Tensor] = {}
@@ -1259,9 +1412,9 @@ def main() -> None:
                 mask = param.abs() < threshold
                 param.masked_fill_(mask, 0.0)
 
-    # INT6 mixed quantization + zstd/zlib export
+    # Adaptive mixed quantization + zstd/zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
+    quant_result, quant_meta = mixed_quantize_adaptive(sd_cpu, {"mlp", "attn", "bigram"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
