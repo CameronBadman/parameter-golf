@@ -38,6 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 class Hyperparameters:
+    _world_size_hint = int(os.environ.get("WORLD_SIZE", "1"))
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -46,15 +47,16 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 42))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000 if _world_size_hint == 1 else 500))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.2 if _world_size_hint == 1 else 0.0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 131_072 if _world_size_hint == 1 else 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1500.0 if _world_size_hint == 1 else 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -866,9 +868,10 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    default_grad_accum_steps = 2 if world_size == 1 else 8 // world_size
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", default_grad_accum_steps))
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1037,6 +1040,7 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"warmdown_iters:{args.warmdown_iters} warmdown_frac:{args.warmdown_frac}")
     log0(f"seed:{args.seed}")
     log0(
         f"mlp_tie_groups:{args.mlp_tie_groups} early_mlp_shared_layers:{args.early_mlp_shared_layers} "
@@ -1053,6 +1057,12 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None and args.warmdown_frac > 0:
+            warmdown_start_ms = max_wallclock_ms * max(1.0 - args.warmdown_frac, 0.0)
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+            warmdown_window_ms = max(max_wallclock_ms - warmdown_start_ms, 1e-9)
+            return max((max_wallclock_ms - elapsed_ms) / warmdown_window_ms, 0.0)
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
