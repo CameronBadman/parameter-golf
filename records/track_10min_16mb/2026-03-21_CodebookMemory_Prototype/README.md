@@ -1,18 +1,17 @@
-# Codebook Memory Prototype
+# Logit Transition Prototype
 
-Prototype fork of the March 20 record script with a compile-friendly sequence conditioner added on top of the existing 10-layer mixed-int5/int6 recipe.
+Prototype fork of the March 20 record script with a direct logit-side transition model added on top of the existing 10-layer mixed-int5/int6 recipe.
 
 ## Goal
 
-Test whether a tiny global conditioning pathway can buy useful capacity without breaking compilation or throughput.
+Test whether a compact output-side transition model can buy useful local language-model capacity without perturbing the transformer graph too much.
 
 ## What Changed
 
-- Added `SharedCodebookMemory` as a sequence-level conditioner
-- Mean-pools the sequence into a summary vector
-- Applies a small dense bottleneck and projects back to model space
-- Broadcasts the resulting conditioning vector across the sequence
-- Memory can be injected at `input`, `mid`, or `all` via `MEMORY_LAYERS`
+- Added `LowRankTransitionHead`, a direct low-rank logit correction from the previous token
+- Looks up a low-rank factor for the previous token and projects it into vocab logits
+- Adds the correction directly to `lm_head` logits before the soft cap
+- Avoids any new residual-stream branch or hidden-state retrieval path
 
 The rest of the strong baseline remains intact:
 
@@ -24,17 +23,14 @@ The rest of the strong baseline remains intact:
 - SWA
 - Sliding-window evaluation
 
-## Default Memory Settings
+## Default Transition Settings
 
 ```bash
-MEMORY_SLOTS=256
-MEMORY_DIM=128
-MEMORY_TOPK=4
-MEMORY_LAYERS=mid
-MEMORY_SCALE_INIT=0.02
+TRANSITION_RANK=32
+TRANSITION_SCALE_INIT=0.02
 ```
 
-This is intentionally small enough to be a first-pass probe rather than a fully optimized auxiliary pathway.
+This is intentionally small enough to be a first-pass probe rather than a fully optimized output model.
 
 ## Run
 
@@ -46,13 +42,11 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 Useful sweeps:
 
 ```bash
-MEMORY_SLOTS=128,256,512
-MEMORY_DIM=64,128
-MEMORY_TOPK=2,4,8
-MEMORY_LAYERS=input,mid,all
+TRANSITION_RANK=8,16,32,64
+TRANSITION_SCALE_INIT=0.01,0.02,0.05
 ```
 
 ## Notes
 
-- Conditioner parameters currently quantize through the existing export path rather than the special int5/int6 categories used for MLP/attention.
+- Transition parameters currently quantize through the existing export path rather than the special int5/int6 categories used for MLP/attention.
 - This is a prototype, not a validated submission. `submission.json` is a placeholder until runs exist.

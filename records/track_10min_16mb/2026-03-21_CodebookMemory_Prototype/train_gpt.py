@@ -88,11 +88,8 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    memory_slots = int(os.environ.get("MEMORY_SLOTS", 256))
-    memory_dim = int(os.environ.get("MEMORY_DIM", 128))
-    memory_topk = int(os.environ.get("MEMORY_TOPK", 4))
-    memory_layers = os.environ.get("MEMORY_LAYERS", "mid").strip().lower()
-    memory_scale_init = float(os.environ.get("MEMORY_SCALE_INIT", 0.02))
+    transition_rank = int(os.environ.get("TRANSITION_RANK", 32))
+    transition_scale_init = float(os.environ.get("TRANSITION_SCALE_INIT", 0.02))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
@@ -617,24 +614,22 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
-class SharedCodebookMemory(nn.Module):
-    """Compile-friendly sequence conditioner."""
-    def __init__(self, model_dim: int, memory_slots: int, memory_dim: int, topk: int, scale_init: float):
+class LowRankTransitionHead(nn.Module):
+    """Direct logit correction from the previous token via a low-rank factorization."""
+    def __init__(self, vocab_size: int, rank: int, scale_init: float):
         super().__init__()
-        self.query = CastedLinear(model_dim, memory_dim, bias=False)
-        self.expand = CastedLinear(memory_dim, memory_dim, bias=False)
-        self.proj = CastedLinear(memory_dim, model_dim, bias=False)
+        self.left = nn.Embedding(vocab_size, rank)
+        self.right = nn.Embedding(vocab_size, rank)
         self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
-        nn.init.orthogonal_(self.query.weight)
-        nn.init.orthogonal_(self.expand.weight)
-        nn.init.orthogonal_(self.proj.weight)
+        nn.init.zeros_(self.left.weight)
+        nn.init.zeros_(self.right.weight)
 
-    def forward(self, x: Tensor) -> Tensor:
-        summary = x.mean(dim=1)
-        h = self.query(summary)
-        h = torch.relu(self.expand(h))
-        out = self.proj(h).to(dtype=x.dtype)
-        return out[:, None, :] * self.scale.to(dtype=x.dtype)
+    def forward(self, token_ids: Tensor) -> Tensor:
+        prev = torch.empty_like(token_ids)
+        prev[:, 0] = 0
+        prev[:, 1:] = token_ids[:, :-1]
+        features = self.left(prev)
+        return F.linear(features, self.right.weight) * self.scale.to(dtype=features.dtype)
 
 
 class Block(nn.Module):
@@ -673,11 +668,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        memory_slots: int = 0,
-        memory_dim: int = 128,
-        memory_topk: int = 4,
-        memory_layers: str = "mid",
-        memory_scale_init: float = 0.02,
+        transition_rank: int = 0,
+        transition_scale_init: float = 0.02,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -687,10 +679,9 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.memory_layers = memory_layers
-        self.memory = (
-            SharedCodebookMemory(model_dim, memory_slots, memory_dim, memory_topk, memory_scale_init)
-            if memory_slots > 0
+        self.transition = (
+            LowRankTransitionHead(vocab_size, transition_rank, transition_scale_init)
+            if transition_rank > 0
             else None
         )
         self.num_encoder_layers = num_layers // 2
@@ -709,12 +700,6 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
-
-    def _use_memory_at_input(self) -> bool:
-        return self.memory is not None and self.memory_layers in {"input", "all"}
-
-    def _use_memory_in_middle(self) -> bool:
-        return self.memory is not None and self.memory_layers in {"mid", "all"}
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -736,15 +721,11 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        if self._use_memory_at_input():
-            x = x + self.memory(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        if self._use_memory_in_middle():
-            x = x + self.memory(self.final_norm(x))
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -757,6 +738,8 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        if self.transition is not None:
+            logits_proj = logits_proj + self.transition(input_ids).reshape(-1, logits_proj.size(-1))
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
 
@@ -766,15 +749,11 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
-        if self._use_memory_at_input():
-            x = x + self.memory(x)
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        if self._use_memory_in_middle():
-            x = x + self.memory(self.final_norm(x))
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
@@ -784,6 +763,8 @@ class GPT(nn.Module):
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
+        if self.transition is not None:
+            logits_proj = logits_proj + self.transition(input_ids)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
@@ -967,11 +948,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        memory_slots=args.memory_slots,
-        memory_dim=args.memory_dim,
-        memory_topk=args.memory_topk,
-        memory_layers=args.memory_layers,
-        memory_scale_init=args.memory_scale_init,
+        transition_rank=args.transition_rank,
+        transition_scale_init=args.transition_scale_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -994,8 +972,8 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    if base_model.memory is not None:
-        scalar_params.append(base_model.memory.scale)
+    if base_model.transition is not None:
+        scalar_params.append(base_model.transition.scale)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1003,12 +981,9 @@ def main() -> None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
-    if base_model.memory is not None:
-        matrix_params.extend([
-            base_model.memory.query.weight,
-            base_model.memory.expand.weight,
-            base_model.memory.proj.weight,
-        ])
+    if base_model.transition is not None:
+        tok_params.append({"params": [base_model.transition.left.weight], "lr": token_lr, "base_lr": token_lr})
+        matrix_params.append(base_model.transition.right.weight)
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
@@ -1057,10 +1032,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
-    log0(
-        f"memory_slots:{args.memory_slots} memory_dim:{args.memory_dim} "
-        f"memory_topk:{args.memory_topk} memory_layers:{args.memory_layers}"
-    )
+    log0(f"transition_rank:{args.transition_rank} transition_scale_init:{args.transition_scale_init}")
     log0(f"compile_model:{args.compile_model}")
 
     # DATA LOADER & MODEL WARMUP
