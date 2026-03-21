@@ -93,6 +93,7 @@ class Hyperparameters:
     memory_topk = int(os.environ.get("MEMORY_TOPK", 4))
     memory_layers = os.environ.get("MEMORY_LAYERS", "mid").strip().lower()
     memory_scale_init = float(os.environ.get("MEMORY_SCALE_INIT", 0.02))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -987,7 +988,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.compile_model else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1072,6 +1073,7 @@ def main() -> None:
         f"memory_slots:{args.memory_slots} memory_dim:{args.memory_dim} "
         f"memory_topk:{args.memory_topk} memory_layers:{args.memory_layers}"
     )
+    log0(f"compile_model:{args.compile_model}")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
