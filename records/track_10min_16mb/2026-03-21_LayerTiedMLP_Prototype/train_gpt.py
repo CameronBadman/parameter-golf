@@ -976,10 +976,11 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        shared_v_embed = self.ve_shared(input_ids) if self.ve_shared is not None else None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
-            v_embed = self.ve_shared(input_ids) if self.ve_shared is not None and i in self.ve_layer_indices else None
+            v_embed = shared_v_embed if shared_v_embed is not None and i in self.ve_layer_indices else None
             x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -987,7 +988,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block_idx = self.num_encoder_layers + i
             block = self.blocks[block_idx]
-            v_embed = self.ve_shared(input_ids) if self.ve_shared is not None and block_idx in self.ve_layer_indices else None
+            v_embed = shared_v_embed if shared_v_embed is not None and block_idx in self.ve_layer_indices else None
             x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
         x = self.final_norm(x)
         hidden = x
@@ -1028,10 +1029,11 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
+        shared_v_embed = self.ve_shared(input_ids) if self.ve_shared is not None else None
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             block = self.blocks[i]
-            v_embed = self.ve_shared(input_ids) if self.ve_shared is not None and i in self.ve_layer_indices else None
+            v_embed = shared_v_embed if shared_v_embed is not None and i in self.ve_layer_indices else None
             x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -1039,7 +1041,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block_idx = self.num_encoder_layers + i
             block = self.blocks[block_idx]
-            v_embed = self.ve_shared(input_ids) if self.ve_shared is not None and block_idx in self.ve_layer_indices else None
+            v_embed = shared_v_embed if shared_v_embed is not None and block_idx in self.ve_layer_indices else None
             x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1287,7 +1289,6 @@ def main() -> None:
         scalar_params.append(base_model.ve_shared.scale)
         if base_model.ve_shared.proj is not None:
             matrix_params.append(base_model.ve_shared.proj.weight)
-        scalar_params.extend(block.ve_scale for block in base_model.blocks if block.ve_scale is not None)
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
