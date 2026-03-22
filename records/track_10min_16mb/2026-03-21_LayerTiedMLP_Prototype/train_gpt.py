@@ -97,6 +97,8 @@ class Hyperparameters:
     xsa_num_kv_heads = int(os.environ.get("XSA_NUM_KV_HEADS", 4))
     adapter_rank = int(os.environ.get("ADAPTER_RANK", 0))
     adapter_last_n = int(os.environ.get("ADAPTER_LAST_N", 0))
+    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 0))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.2))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -857,6 +859,8 @@ class GPT(nn.Module):
         xsa_num_kv_heads: int = 0,
         adapter_rank: int = 0,
         adapter_last_n: int = 0,
+        mtp_num_heads: int = 0,
+        mtp_loss_weight: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -864,6 +868,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_num_heads = mtp_num_heads
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         early_layers = min(max(early_mlp_shared_layers, 0), num_layers)
@@ -908,6 +914,11 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.mtp_heads = nn.ModuleList(
+            [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)]
+        )
+        for head in self.mtp_heads:
+            head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -941,7 +952,9 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block = self.blocks[self.num_encoder_layers + i]
             x = block(x, x0, self.shared_mlps[block.mlp_idx])
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        x = self.final_norm(x)
+        hidden = x
+        x = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -950,7 +963,26 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
+            _, seqlen, dim = hidden.shape
+            mtp_loss_sum = x.new_zeros(())
+            mtp_loss_count = 0
+            for k, mtp_head in enumerate(self.mtp_heads):
+                valid_t = seqlen - (k + 1)
+                if valid_t <= 0:
+                    continue
+                mtp_hidden = hidden[:, :valid_t, :].reshape(-1, dim)
+                mtp_targets = target_ids[:, k + 1 :].reshape(-1)
+                mtp_logits_proj = mtp_head(mtp_hidden)
+                mtp_logits = self.logit_softcap * torch.tanh(mtp_logits_proj / self.logit_softcap)
+                mtp_loss_sum = mtp_loss_sum + F.cross_entropy(mtp_logits.float(), mtp_targets, reduction="mean")
+                mtp_loss_count += 1
+            if mtp_loss_count > 0:
+                main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+
+        return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1165,6 +1197,8 @@ def main() -> None:
         xsa_num_kv_heads=args.xsa_num_kv_heads,
         adapter_rank=args.adapter_rank,
         adapter_last_n=args.adapter_last_n,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1183,6 +1217,8 @@ def main() -> None:
         p for name, p in shared_mlp_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     )
+    if base_model.mtp_num_heads > 0:
+        matrix_params.extend(p for p in base_model.mtp_heads.parameters() if p.ndim == 2)
     scalar_params = [
         p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
@@ -1258,6 +1294,8 @@ def main() -> None:
     )
     log0(f"xsa_layers:{args.xsa_layers} xsa_num_kv_heads:{args.xsa_num_kv_heads}")
     log0(f"adapter_rank:{args.adapter_rank} adapter_last_n:{args.adapter_last_n}")
+    mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
+    log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1423,8 +1461,14 @@ def main() -> None:
         base_model.load_state_dict(avg_state, strict=True)
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
+    full_state_dict = base_model.state_dict()
+    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+    excluded_mtp = sum(int(t.numel()) for k, t in full_state_dict.items() if "mtp_heads" in k)
+    if excluded_mtp > 0:
+        log0(f"export_excluding_mtp_params:{excluded_mtp}")
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_sd, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
@@ -1440,7 +1484,7 @@ def main() -> None:
                 param.masked_fill_(mask, 0.0)
 
     # Adaptive mixed quantization + zstd/zlib export
-    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     quant_result, quant_meta = mixed_quantize_adaptive(sd_cpu, {"mlp", "attn", "bigram"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
