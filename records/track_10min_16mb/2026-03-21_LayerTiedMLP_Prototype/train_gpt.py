@@ -102,6 +102,7 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "")
+    recycle_passes = int(os.environ.get("RECYCLE_PASSES", 1))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -891,6 +892,7 @@ class GPT(nn.Module):
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "",
+        recycle_passes: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -900,11 +902,13 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
+        self.recycle_passes = max(int(recycle_passes), 1)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim) if self.ve_layer_indices else None
+        self.recycle_pass_emb = nn.Parameter(torch.zeros(self.recycle_passes, model_dim, dtype=torch.float32)) if self.recycle_passes > 1 else None
         early_layers = min(max(early_mlp_shared_layers, 0), num_layers)
         if early_layers > 0:
             early_groups = min(max(early_mlp_tie_groups, 1), early_layers)
@@ -955,6 +959,23 @@ class GPT(nn.Module):
             head._zero_init = True
         self._init_weights()
 
+    def _run_stack(self, x: Tensor, x0: Tensor, input_ids: Tensor) -> Tensor:
+        shared_v_embed = self.ve_shared(input_ids) if self.ve_shared is not None else None
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            block = self.blocks[i]
+            v_embed = shared_v_embed if shared_v_embed is not None and i in self.ve_layer_indices else None
+            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block_idx = self.num_encoder_layers + i
+            block = self.blocks[block_idx]
+            v_embed = shared_v_embed if shared_v_embed is not None and block_idx in self.ve_layer_indices else None
+            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
+        return x
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -976,20 +997,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        shared_v_embed = self.ve_shared(input_ids) if self.ve_shared is not None else None
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            block = self.blocks[i]
-            v_embed = shared_v_embed if shared_v_embed is not None and i in self.ve_layer_indices else None
-            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            block_idx = self.num_encoder_layers + i
-            block = self.blocks[block_idx]
-            v_embed = shared_v_embed if shared_v_embed is not None and block_idx in self.ve_layer_indices else None
-            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
+        for pass_idx in range(self.recycle_passes):
+            if self.recycle_pass_emb is not None:
+                x = x + self.recycle_pass_emb[pass_idx].to(dtype=x.dtype)[None, None, :]
+            x = self._run_stack(x, x0, input_ids)
         x = self.final_norm(x)
         hidden = x
         x = x.reshape(-1, x.size(-1))
@@ -1029,20 +1040,10 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        shared_v_embed = self.ve_shared(input_ids) if self.ve_shared is not None else None
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            block = self.blocks[i]
-            v_embed = shared_v_embed if shared_v_embed is not None and i in self.ve_layer_indices else None
-            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            block_idx = self.num_encoder_layers + i
-            block = self.blocks[block_idx]
-            v_embed = shared_v_embed if shared_v_embed is not None and block_idx in self.ve_layer_indices else None
-            x = block(x, x0, self.shared_mlps[block.mlp_idx], v_embed=v_embed)
+        for pass_idx in range(self.recycle_passes):
+            if self.recycle_pass_emb is not None:
+                x = x + self.recycle_pass_emb[pass_idx].to(dtype=x.dtype)[None, None, :]
+            x = self._run_stack(x, x0, input_ids)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1244,6 +1245,7 @@ def main() -> None:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
+        recycle_passes=args.recycle_passes,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1275,6 +1277,8 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
+    if base_model.recycle_pass_emb is not None:
+        scalar_params.append(base_model.recycle_pass_emb)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
 
@@ -1347,6 +1351,7 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     log0(f"ve_enabled:{args.ve_enabled} ve_dim:{args.ve_dim} ve_layers:{args.ve_layers}")
+    log0(f"recycle_passes:{args.recycle_passes}")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
