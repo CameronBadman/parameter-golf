@@ -38,6 +38,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 class Hyperparameters:
+    _world_size_hint = int(os.environ.get("WORLD_SIZE", "1"))
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -46,15 +47,16 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 42))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000 if _world_size_hint == 1 else 500))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_frac = float(os.environ.get("WARMDOWN_FRAC", 0.2 if _world_size_hint == 1 else 0.0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 131_072 if _world_size_hint == 1 else 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1500.0 if _world_size_hint == 1 else 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -63,6 +65,9 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    recurrent_start_layer = int(os.environ.get("RECURRENT_START_LAYER", 0))
+    recurrent_layers = int(os.environ.get("RECURRENT_LAYERS", 0))
+    recurrent_steps = int(os.environ.get("RECURRENT_STEPS", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -85,12 +90,24 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    validation_mode = os.environ.get("VALIDATION_MODE", "sliding")
+    export_val_every = int(
+        os.environ.get(
+            "EXPORT_VAL_EVERY",
+            str(0 if val_loss_every <= 0 else val_loss_every * 4),
+        )
+    )
+    prune_frac = float(os.environ.get("PRUNE_FRAC", 0.03))
+    prune_min_numel = int(os.environ.get("PRUNE_MIN_NUMEL", 65_536))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     transition_rank = int(os.environ.get("TRANSITION_RANK", 32))
     transition_scale_init = float(os.environ.get("TRANSITION_SCALE_INIT", 0.02))
     compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    ddp_static_graph = bool(int(os.environ.get("DDP_STATIC_GRAPH", "1")))
+    ddp_gradient_as_bucket_view = bool(int(os.environ.get("DDP_GRADIENT_AS_BUCKET_VIEW", "1")))
+    ddp_bucket_cap_mb = int(os.environ.get("DDP_BUCKET_CAP_MB", 200))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -456,7 +473,20 @@ class DistributedTokenLoader:
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
+        usable_local_tokens = (local_tokens // seq_len) * seq_len
+        if usable_local_tokens <= 0:
+            raise ValueError(
+                "TRAIN_BATCH_TOKENS must provide at least one sequence per rank/microstep; "
+                f"got TRAIN_BATCH_TOKENS={global_tokens}, WORLD_SIZE={self.world_size}, "
+                f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={seq_len}"
+            )
+        if usable_local_tokens != local_tokens:
+            raise ValueError(
+                "TRAIN_BATCH_TOKENS must divide cleanly into full sequences per rank/microstep; "
+                f"got TRAIN_BATCH_TOKENS={global_tokens}, WORLD_SIZE={self.world_size}, "
+                f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={seq_len}"
+            )
+        per_rank_span = usable_local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
         local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
@@ -661,6 +691,9 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: float,
+        recurrent_start_layer: int,
+        recurrent_layers: int,
+        recurrent_steps: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -689,12 +722,15 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
+        self.num_layers = num_layers
         self.blocks = nn.ModuleList(
-            [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_layers)
-            ]
+            [Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init) for _ in range(num_layers)]
         )
+        if recurrent_steps <= 0:
+            raise ValueError(f"recurrent_steps must be positive, got {recurrent_steps}")
+        self.recurrent_start_layer = max(0, recurrent_start_layer)
+        self.recurrent_end_layer = min(num_layers, self.recurrent_start_layer + max(recurrent_layers, 0))
+        self.recurrent_steps = recurrent_steps
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -704,7 +740,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        num_layers = len(self.blocks)
+        num_layers = self.num_layers
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -715,6 +751,11 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
+    def layer_steps(self, layer_idx: int) -> int:
+        if self.recurrent_start_layer <= layer_idx < self.recurrent_end_layer:
+            return self.recurrent_steps
+        return 1
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -724,12 +765,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            for _ in range(self.layer_steps(i)):
+                x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            for _ in range(self.layer_steps(layer_idx)):
+                x = self.blocks[layer_idx](x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -752,12 +796,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            for _ in range(self.layer_steps(i)):
+                x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            for _ in range(self.layer_steps(layer_idx)):
+                x = self.blocks[layer_idx](x, x0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -848,6 +895,112 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def validate_train_batch_tokens(global_tokens: int, world_size: int, grad_accum_steps: int, seq_len: int) -> None:
+    local_tokens = global_tokens // (world_size * grad_accum_steps)
+    usable_local_tokens = (local_tokens // seq_len) * seq_len
+    if usable_local_tokens != local_tokens:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS must divide cleanly into full sequences per rank/microstep; "
+            f"got TRAIN_BATCH_TOKENS={global_tokens}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={seq_len}"
+        )
+
+
+def should_use_sliding_eval(args: Hyperparameters) -> bool:
+    if args.validation_mode == "sliding":
+        return 0 < args.eval_stride < args.train_seq_len
+    if args.validation_mode == "standard":
+        return False
+    raise ValueError(f"VALIDATION_MODE must be 'sliding' or 'standard', got {args.validation_mode!r}")
+
+
+def apply_magnitude_pruning(
+    state_dict: dict[str, Tensor],
+    prune_frac: float,
+    prune_min_numel: int,
+) -> dict[str, Tensor]:
+    pruned = {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
+    if prune_frac <= 0.0:
+        return pruned
+    with torch.no_grad():
+        for name, tensor in pruned.items():
+            if tensor.ndim != 2 or tensor.numel() <= prune_min_numel or not tensor.is_floating_point():
+                continue
+            threshold = torch.quantile(tensor.abs().float().flatten(), prune_frac)
+            mask = tensor.abs() < threshold
+            tensor.masked_fill_(mask, 0.0)
+    return pruned
+
+
+def build_export_artifact_state(
+    state_dict: dict[str, Tensor],
+    prune_frac: float,
+    prune_min_numel: int,
+) -> tuple[dict[str, Tensor], dict[str, Tensor], dict[str, object], bytes]:
+    pruned_state = apply_magnitude_pruning(state_dict, prune_frac=prune_frac, prune_min_numel=prune_min_numel)
+    quant_result, quant_meta = mixed_quantize_int6(pruned_state, {"mlp", "attn", "bigram"})
+    quant_buf = io.BytesIO()
+    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    if _COMPRESSOR == "zstd":
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, 9)
+    return pruned_state, quant_result, quant_meta, quant_blob
+
+
+def load_export_roundtrip_state(quant_blob: bytes, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    if _COMPRESSOR == "zstd":
+        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob)
+    else:
+        decompressed = zlib.decompress(quant_blob)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
+    return dequantize_mixed_int6(quant_state["w"], quant_state["m"], template_sd)
+
+
+def eval_model_state(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[str, float, float]:
+    if should_use_sliding_eval(args):
+        val_loss, val_bpb = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            stride=args.eval_stride,
+            batch_seqs=args.eval_batch_seqs,
+        )
+        return "sliding_window", val_loss, val_bpb
+    val_loss, val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
+    return "standard", val_loss, val_bpb
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -865,9 +1018,11 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    default_grad_accum_steps = 2 if world_size == 1 else 8 // world_size
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", default_grad_accum_steps))
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
+    validate_train_batch_tokens(args.train_batch_tokens, world_size, grad_accum_steps, args.train_seq_len)
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -941,6 +1096,9 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        recurrent_start_layer=args.recurrent_start_layer,
+        recurrent_layers=args.recurrent_layers,
+        recurrent_steps=args.recurrent_steps,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -956,7 +1114,18 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.compile_model else base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = (
+        DDP(
+            compiled_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
+            gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+            static_graph=args.ddp_static_graph,
+        )
+        if distributed
+        else compiled_model
+    )
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
@@ -1031,9 +1200,23 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"warmdown_iters:{args.warmdown_iters} warmdown_frac:{args.warmdown_frac}")
     log0(f"seed:{args.seed}")
     log0(f"transition_rank:{args.transition_rank} transition_scale_init:{args.transition_scale_init}")
+    log0(
+        f"recurrence:start:{base_model.recurrent_start_layer} end:{base_model.recurrent_end_layer} "
+        f"steps:{base_model.recurrent_steps}"
+    )
     log0(f"compile_model:{args.compile_model}")
+    log0(
+        f"ddp_static_graph:{args.ddp_static_graph} ddp_bucket_cap_mb:{args.ddp_bucket_cap_mb} "
+        f"ddp_gradient_as_bucket_view:{args.ddp_gradient_as_bucket_view}"
+    )
+    log0(
+        f"validation_mode:{args.validation_mode} eval_stride:{args.eval_stride} "
+        f"eval_batch_seqs:{args.eval_batch_seqs} export_val_every:{args.export_val_every}"
+    )
+    log0(f"export_prune_frac:{args.prune_frac} export_prune_min_numel:{args.prune_min_numel}")
 
     # DATA LOADER & MODEL WARMUP
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1045,6 +1228,12 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None and args.warmdown_frac > 0:
+            warmdown_start_ms = max_wallclock_ms * max(1.0 - args.warmdown_frac, 0.0)
+            if elapsed_ms < warmdown_start_ms:
+                return 1.0
+            warmdown_window_ms = max(max_wallclock_ms - warmdown_start_ms, 1e-9)
+            return max((max_wallclock_ms - elapsed_ms) / warmdown_window_ms, 0.0)
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
@@ -1097,14 +1286,58 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args, model, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            val_mode, val_loss, val_bpb = eval_model_state(
+                args,
+                model,
+                base_model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_mode:{val_mode} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            should_export_validate = (
+                last_step
+                or (
+                    args.export_val_every > 0
+                    and step > 0
+                    and step % args.export_val_every == 0
+                )
+            )
+            if should_export_validate:
+                live_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
+                _, _, _, quant_blob = build_export_artifact_state(
+                    live_state,
+                    prune_frac=args.prune_frac,
+                    prune_min_numel=args.prune_min_numel,
+                )
+                export_state = load_export_roundtrip_state(quant_blob, live_state)
+                base_model.load_state_dict(export_state, strict=True)
+                export_mode, export_loss, export_bpb = eval_model_state(
+                    args,
+                    model,
+                    base_model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                base_model.load_state_dict(live_state, strict=True)
+                log0(
+                    f"step:{step}/{args.iterations} export_mode:{export_mode} export_val_loss:{export_loss:.4f} "
+                    f"export_val_bpb:{export_bpb:.4f} export_delta_bpb:{export_bpb - val_bpb:+.4f}"
+                )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1201,66 +1434,52 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Magnitude pruning: zero out smallest weights to improve compression
-    with torch.no_grad():
-        for name, param in base_model.named_parameters():
-            if param.ndim == 2 and param.numel() > 65536:
-                threshold = torch.quantile(param.abs().float().flatten(), 0.03)
-                mask = param.abs() < threshold
-                param.masked_fill_(mask, 0.0)
-
-    # INT6 mixed quantization + zstd/zlib export
-    sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    if _COMPRESSOR == "zstd":
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
-    else:
-        quant_blob = zlib.compress(quant_raw, 9)
+    live_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
+    pruned_state, _, _, quant_blob = build_export_artifact_state(
+        live_state,
+        prune_frac=args.prune_frac,
+        prune_min_numel=args.prune_min_numel,
+    )
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model mixed-int+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size mixed-int+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    if _COMPRESSOR == "zstd":
-        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
-    else:
-        decompressed = zlib.decompress(quant_blob_disk)
-    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    deq_state = load_export_roundtrip_state(quant_blob_disk, live_state)
     base_model.load_state_dict(deq_state, strict=True)
 
-    # Sliding window eval on int6-roundtripped weights
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
-        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
-        )
-    else:
-        log0("final_eval_mode:standard")
-        q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
+    final_eval_mode, q_val_loss, q_val_bpb = eval_model_state(
+        args,
+        model,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+    )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_export_eval_mode:{final_eval_mode} stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs} "
+        f"prune_frac:{args.prune_frac}"
+    )
+    log0(
+        f"final_export_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_export_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
