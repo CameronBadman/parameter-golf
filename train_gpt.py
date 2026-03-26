@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import hashlib
 import io
 import math
 import os
@@ -306,6 +307,17 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+EXPORT_ROTATION_ENABLED = bool(int(os.environ.get("EXPORT_ROTATION_ENABLED", "0")))
+EXPORT_ROTATION_BLOCK_SIZE = int(os.environ.get("EXPORT_ROTATION_BLOCK_SIZE", 256))
+EXPORT_ROTATION_MIN_NUMEL = int(os.environ.get("EXPORT_ROTATION_MIN_NUMEL", 131_072))
+EXPORT_ROTATION_MIN_COLS = int(os.environ.get("EXPORT_ROTATION_MIN_COLS", 128))
+EXPORT_RESIDUAL_ENABLED = bool(int(os.environ.get("EXPORT_RESIDUAL_ENABLED", "0")))
+EXPORT_RESIDUAL_MIN_NUMEL = int(os.environ.get("EXPORT_RESIDUAL_MIN_NUMEL", 131_072))
+EXPORT_ROTATION_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("EXPORT_ROTATION_NAME_PATTERNS", "attn.,mlp.").split(",")
+    if pattern
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -318,8 +330,97 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def _largest_power_of_two_leq(n: int) -> int:
+    return 1 << (n.bit_length() - 1) if n > 0 else 0
+
+def _rotation_block_size(cols: int) -> int:
+    capped = min(cols, EXPORT_ROTATION_BLOCK_SIZE)
+    return _largest_power_of_two_leq(capped)
+
+def _uses_rotated_export_quant(name: str, t: Tensor) -> bool:
+    return (
+        EXPORT_ROTATION_ENABLED
+        and t.ndim == 2
+        and t.numel() >= EXPORT_ROTATION_MIN_NUMEL
+        and t.shape[-1] >= EXPORT_ROTATION_MIN_COLS
+        and any(pattern in name for pattern in EXPORT_ROTATION_NAME_PATTERNS)
+        and _rotation_block_size(int(t.shape[-1])) >= 2
+    )
+
+def _deterministic_signs(name: str, block_idx: int, size: int, dtype: torch.dtype) -> Tensor:
+    seed_bytes = hashlib.blake2b(f"{name}:{block_idx}".encode("utf-8"), digest_size=8).digest()
+    seed = int.from_bytes(seed_bytes, "little", signed=False)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    signs = torch.randint(0, 2, (size,), generator=gen, dtype=torch.int8)
+    return signs.to(dtype=dtype).mul_(2).sub_(1)
+
+def _fwht_last_dim(x: Tensor) -> Tensor:
+    n = int(x.shape[-1])
+    if n <= 1:
+        return x
+    if n & (n - 1):
+        raise ValueError(f"FWHT expects a power-of-two trailing dimension, got {n}")
+    y = x.reshape(-1, n).contiguous()
+    h = 1
+    while h < n:
+        y = y.view(-1, n // (2 * h), 2, h)
+        a = y[:, :, 0, :].clone()
+        b = y[:, :, 1, :].clone()
+        y[:, :, 0, :] = a + b
+        y[:, :, 1, :] = a - b
+        y = y.view(-1, n)
+        h *= 2
+    return y.view_as(x) / math.sqrt(float(n))
+
+def _apply_structured_rotation(name: str, t: Tensor, block_size: int) -> Tensor:
+    rotated = t.float().contiguous().clone()
+    cols = int(rotated.shape[-1])
+    for block_idx, start in enumerate(range(0, cols - block_size + 1, block_size)):
+        end = start + block_size
+        signs = _deterministic_signs(name, block_idx, block_size, rotated.dtype)
+        block = rotated[:, start:end]
+        block.mul_(signs)
+        rotated[:, start:end] = _fwht_last_dim(block)
+    return rotated
+
+def _invert_structured_rotation(name: str, t: Tensor, block_size: int) -> Tensor:
+    restored = t.float().contiguous().clone()
+    cols = int(restored.shape[-1])
+    for block_idx, start in enumerate(range(0, cols - block_size + 1, block_size)):
+        end = start + block_size
+        signs = _deterministic_signs(name, block_idx, block_size, restored.dtype)
+        block = _fwht_last_dim(restored[:, start:end])
+        restored[:, start:end] = block.mul_(signs)
+    return restored
+
+def _pack_sign_bits(bits: Tensor) -> Tensor:
+    flat = bits.to(dtype=torch.uint8, device="cpu").contiguous().view(-1).numpy()
+    return torch.from_numpy(np.packbits(flat, bitorder="little")).contiguous()
+
+def _unpack_sign_bits(packed: Tensor, shape: tuple[int, ...]) -> Tensor:
+    total = int(np.prod(shape))
+    flat = np.unpackbits(packed.to(device="cpu", dtype=torch.uint8).numpy(), bitorder="little", count=total)
+    return torch.from_numpy(flat.astype(np.uint8, copy=False)).view(*shape).contiguous()
+
+def _build_residual_sign_correction(t: Tensor, reconstructed: Tensor) -> tuple[Tensor, Tensor]:
+    residual = t.float() - reconstructed.float()
+    if residual.ndim == 2:
+        scale = residual.abs().mean(dim=1).clamp_min(1e-8).to(dtype=torch.float16).contiguous()
+        signs = (residual >= 0).to(dtype=torch.uint8).contiguous()
+        return _pack_sign_bits(signs), scale
+    scale = torch.tensor(float(residual.abs().mean().clamp_min(1e-8).item()), dtype=torch.float16)
+    signs = (residual >= 0).to(dtype=torch.uint8).contiguous()
+    return _pack_sign_bits(signs), scale
+
+def quantize_float_tensor(name: str, t: Tensor) -> tuple[Tensor, Tensor, dict[str, object], Tensor | None, Tensor | None]:
     t32 = t.float()
+    qmeta: dict[str, object] = {}
+    if _uses_rotated_export_quant(name, t32):
+        block_size = _rotation_block_size(int(t32.shape[-1]))
+        t32 = _apply_structured_rotation(name, t32, block_size)
+        qmeta["transform"] = "signed_fwht"
+        qmeta["block_size"] = block_size
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
@@ -331,13 +432,31 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        qmeta["scheme"] = "per_row"
+        qmeta["axis"] = 0
+        scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        residual_bits = None
+        residual_scale = None
+        if EXPORT_RESIDUAL_ENABLED and t32.numel() >= EXPORT_RESIDUAL_MIN_NUMEL:
+            deq = (q.float() * scale.float()[:, None]).contiguous()
+            residual_bits, residual_scale = _build_residual_sign_correction(t32, deq)
+            qmeta["residual"] = "sign"
+            qmeta["shape"] = list(t32.shape)
+        return q, scale, qmeta, residual_bits, residual_scale
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+    qmeta["scheme"] = "per_tensor"
+    residual_bits = None
+    residual_scale = None
+    if EXPORT_RESIDUAL_ENABLED and t32.numel() >= EXPORT_RESIDUAL_MIN_NUMEL:
+        deq = (q.float() * float(scale.item())).contiguous()
+        residual_bits, residual_scale = _build_residual_sign_correction(t32, deq)
+        qmeta["residual"] = "sign"
+        qmeta["shape"] = list(t32.shape)
+    return q, scale, qmeta, residual_bits, residual_scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -347,6 +466,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
+    residual_bits: dict[str, Tensor] = {}
+    residual_scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
@@ -377,13 +498,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        q, s, tensor_qmeta, packed_residual, residual_scale = quantize_float_tensor(name, t)
+        if tensor_qmeta:
+            qmeta[name] = tensor_qmeta
         quantized[name] = q
         scales[name] = s
+        if packed_residual is not None and residual_scale is not None:
+            residual_bits[name] = packed_residual
+            residual_scales[name] = residual_scale
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        if packed_residual is not None and residual_scale is not None:
+            stats["int8_payload_bytes"] += tensor_nbytes(packed_residual) + tensor_nbytes(residual_scale)
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -394,6 +520,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     }
     if qmeta:
         obj["qmeta"] = qmeta
+    if residual_bits:
+        obj["residual_bits"] = residual_bits
+        obj["residual_scales"] = residual_scales
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
@@ -401,17 +530,31 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
     qmeta = obj.get("qmeta", {})
+    residual_bits = obj.get("residual_bits", {})
+    residual_scales = obj.get("residual_scales", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        if meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             # Broadcast the saved row scale back across trailing dimensions.
-            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+            restored = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).contiguous()
         else:
             scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            restored = (q.float() * scale).contiguous()
+        if meta.get("residual") == "sign" and name in residual_bits and name in residual_scales:
+            bits = _unpack_sign_bits(residual_bits[name], tuple(int(v) for v in meta["shape"])).float()
+            signs = bits.mul_(2.0).sub_(1.0)
+            rs = residual_scales[name]
+            if rs.ndim > 0:
+                restored = restored + signs * rs.float().view(signs.shape[0], *([1] * (signs.ndim - 1)))
+            else:
+                restored = restored + signs * float(rs.item())
+        if meta.get("transform") == "signed_fwht":
+            restored = _invert_structured_rotation(name, restored, int(meta["block_size"]))
+        out[name] = restored.to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
@@ -531,25 +674,54 @@ class Rotary(nn.Module):
         self._cos_cached: Tensor | None = None
         self._sin_cached: Tensor | None = None
 
-    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype, start_pos: int = 0
+    ) -> tuple[Tensor, Tensor]:
         if (
             self._cos_cached is None
             or self._sin_cached is None
-            or self._seq_len_cached != seq_len
+            or self._seq_len_cached < start_pos + seq_len
             or self._cos_cached.device != device
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            total_len = start_pos + seq_len
+            t = torch.arange(total_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+            self._seq_len_cached = total_len
+        cos = self._cos_cached[:, :, start_pos : start_pos + seq_len, :]
+        sin = self._sin_cached[:, :, start_pos : start_pos + seq_len, :]
+        return cos.to(dtype=dtype), sin.to(dtype=dtype)
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+def _quantize_cache_int8(x: Tensor) -> tuple[Tensor, Tensor]:
+    scale = (x.float().abs().amax(dim=-1, keepdim=True) / 127.0).clamp_min(1.0 / 127.0)
+    q = torch.clamp(torch.round(x.float() / scale), -127, 127).to(torch.int8)
+    return q.contiguous(), scale.to(dtype=torch.float16).contiguous()
+
+
+def _dequantize_cache_int8(q: Tensor, scale: Tensor) -> Tensor:
+    return (q.float() * scale.float()).contiguous()
+
+
+def _quantize_cache_qjl(x: Tensor) -> tuple[Tensor, Tensor]:
+    norm = x.float().norm(dim=-1, keepdim=True).div(math.sqrt(float(x.size(-1)))).clamp_min(1e-8)
+    signs = (x >= 0).to(dtype=torch.int8).mul_(2).sub_(1)
+    return signs.contiguous(), norm.to(dtype=torch.float16).contiguous()
+
+
+def _dequantize_cache_qjl(signs: Tensor, norm: Tensor) -> Tensor:
+    return (signs.float() * norm.float()).contiguous()
+
+
+def _append_cache_tensor(existing: Tensor | None, new: Tensor, dim: int = 2) -> Tensor:
+    return new if existing is None else torch.cat((existing, new), dim=dim)
 
 
 class CausalSelfAttention(nn.Module):
@@ -602,6 +774,61 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
+    def forward_cached(
+        self,
+        x: Tensor,
+        cache_state: dict[str, object] | None = None,
+        cache_mode: str = "none",
+    ) -> tuple[Tensor, dict[str, object]]:
+        bsz, seqlen, dim = x.shape
+        if cache_mode not in {"none", "int8", "qjl"}:
+            raise ValueError(f"Unsupported cache_mode={cache_mode}")
+        state = {} if cache_state is None else dict(cache_state)
+        cache_len = int(state.get("len", 0))
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype, start_pos=cache_len)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if cache_mode == "none":
+            state["k"] = _append_cache_tensor(state.get("k"), k)
+            state["v"] = _append_cache_tensor(state.get("v"), v)
+            k_full = state["k"]
+            v_full = state["v"]
+        elif cache_mode == "int8":
+            k_q, k_scale = _quantize_cache_int8(k)
+            v_q, v_scale = _quantize_cache_int8(v)
+            state["k_q"] = _append_cache_tensor(state.get("k_q"), k_q)
+            state["k_scale"] = _append_cache_tensor(state.get("k_scale"), k_scale)
+            state["v_q"] = _append_cache_tensor(state.get("v_q"), v_q)
+            state["v_scale"] = _append_cache_tensor(state.get("v_scale"), v_scale)
+            k_full = _dequantize_cache_int8(state["k_q"], state["k_scale"]).to(dtype=q.dtype)
+            v_full = _dequantize_cache_int8(state["v_q"], state["v_scale"]).to(dtype=q.dtype)
+        else:
+            k_sign, k_norm = _quantize_cache_qjl(k)
+            v_q, v_scale = _quantize_cache_int8(v)
+            state["k_sign"] = _append_cache_tensor(state.get("k_sign"), k_sign)
+            state["k_norm"] = _append_cache_tensor(state.get("k_norm"), k_norm)
+            state["v_q"] = _append_cache_tensor(state.get("v_q"), v_q)
+            state["v_scale"] = _append_cache_tensor(state.get("v_scale"), v_scale)
+            k_full = _dequantize_cache_qjl(state["k_sign"], state["k_norm"]).to(dtype=q.dtype)
+            v_full = _dequantize_cache_int8(state["v_q"], state["v_scale"]).to(dtype=q.dtype)
+        state["len"] = cache_len + seqlen
+        y = F.scaled_dot_product_attention(
+            q,
+            k_full,
+            v_full,
+            attn_mask=None,
+            is_causal=False,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y), state
+
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
@@ -643,6 +870,20 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
+
+    def forward_cached(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        cache_state: dict[str, object] | None = None,
+        cache_mode: str = "none",
+    ) -> tuple[Tensor, dict[str, object]]:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out, new_cache = self.attn.forward_cached(self.attn_norm(x), cache_state, cache_mode=cache_mode)
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x, new_cache
 
 
 class GPT(nn.Module):
@@ -722,6 +963,67 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+    def forward_cached(
+        self,
+        input_ids: Tensor,
+        cache_state: dict[str, object] | None = None,
+        cache_mode: str = "none",
+    ) -> tuple[Tensor, dict[str, object]]:
+        state = {"layers": [None] * len(self.blocks)} if cache_state is None else cache_state
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x, state["layers"][i] = self.blocks[i].forward_cached(
+                x, x0, state["layers"][i], cache_mode=cache_mode
+            )
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            bi = self.num_encoder_layers + i
+            x, state["layers"][bi] = self.blocks[bi].forward_cached(
+                x, x0, state["layers"][bi], cache_mode=cache_mode
+            )
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return logits, state
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int,
+        cache_mode: str = "none",
+        temperature: float = 1.0,
+    ) -> Tensor:
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must be [B, T], got {tuple(input_ids.shape)}")
+        state: dict[str, object] | None = None
+        logits = None
+        for pos in range(input_ids.size(1)):
+            logits, state = self.forward_cached(input_ids[:, pos : pos + 1], state, cache_mode=cache_mode)
+        if logits is None:
+            raise RuntimeError("generate requires a non-empty prompt")
+        out = input_ids
+        for _ in range(max_new_tokens):
+            next_logits = logits[:, -1, :]
+            if temperature <= 0.0:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+            else:
+                probs = F.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            out = torch.cat((out, next_token), dim=1)
+            logits, state = self.forward_cached(next_token, state, cache_mode=cache_mode)
+        return out
 
 
 # -----------------------------
